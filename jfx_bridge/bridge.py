@@ -947,7 +947,10 @@ class BridgeConn(object):
                 )
 
                 if self.host == HOST_STDIO:
-                    self.sock = StreamsBridgeSocket(sys.stdin.buffer, sys.stdout.buffer)
+                    if sys.version_info[0] == 2:
+                        self.sock = StreamsBridgeSocket(sys.stdin, sys.stdout)
+                    else:
+                        self.sock = StreamsBridgeSocket(sys.stdin.buffer, sys.stdout.buffer)
                 else:
                     # Create a socket (SOCK_STREAM means a TCP socket)
                     self.sock = SocketBridgeSocket(host=self.host, port=self.port)
