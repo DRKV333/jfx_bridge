@@ -297,7 +297,7 @@ class Stats:
         return new_stats
 
 
-SIZE_FORMAT = "!I"
+SIZE_FORMAT = str("!I")
 
 
 class BridgeSocketBase(object):
