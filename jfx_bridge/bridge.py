@@ -28,6 +28,11 @@ import textwrap
 import types
 import subprocess
 
+try:
+    from queue import Queue, Empty
+except ImportError:
+    from Queue import Queue, Empty
+
 __version__ = "0.0.0"  # automatically patched by setup.py when packaging
 
 # from six.py's strategy
@@ -295,47 +300,80 @@ class Stats:
 SIZE_FORMAT = "!I"
 
 
-def write_size_and_data_to_socket(sock, data):
-    """ Utility function to pack the size in front of data and send it off """
+class BridgeSocketBase(object):
 
-    # pack the size as network-endian
-    data_size = len(data)
-    size_bytes = struct.pack(SIZE_FORMAT, len(data))
-    package = size_bytes + data
-    total_size = len(size_bytes) + data_size
+    def read_size_and_data(self):
+        """ Utility function to read the size of a data block, followed by all of that data """
 
-    sent = 0
-    # noted errors sending large blobs of data with sendall, so we'll send as much as send() allows and keep trying
-    while sent < total_size:
-        # send it all off
-        bytes_sent = sock.send(package[sent:])
-        sent = sent + bytes_sent
+        size_bytes = self.read_exactly(struct.calcsize(SIZE_FORMAT))
+        size = struct.unpack(SIZE_FORMAT, size_bytes)[0]
+
+        data = self.read_exactly(size)
+        data = data.strip()
+
+        return data
+
+    def write_size_and_data(self, data):
+        """ Utility function to pack the size in front of data and send it off """
+
+        # pack the size as network-endian
+        size_bytes = struct.pack(SIZE_FORMAT, len(data))
+        package = size_bytes + data
+        
+        self.write_exactly(package)
+
+    def read_exactly(self, num_bytes):
+        return b""
+
+    def write_exactly(self, package):
+        pass
+
+    def close(self):
+        pass
 
 
-def read_exactly(sock, num_bytes):
-    """ Utility function to keep reading from the socket until we get the desired number of bytes """
-    data = b""
-    while num_bytes > 0:
-        new_data = sock.recv(num_bytes)
-        if new_data is None:
-            # most likely reason for a none here is the socket being closed on the remote end
-            raise BridgeClosedException()
-        num_bytes = num_bytes - len(new_data)
-        data += new_data
+class SocketBridgeSocket(BridgeSocketBase):
 
-    return data
+    sock = None
 
+    def __init__(
+        self,
+        sock=None,
+        host=None,
+        port=None,
+    ):
+        if sock is not None:
+            self.sock = sock
+        else:
+            # Create a socket (SOCK_STREAM means a TCP socket)
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(10)
+            self.sock.connect((host, port))
 
-def read_size_and_data_from_socket(sock):
-    """ Utility function to read the size of a data block, followed by all of that data """
+    def read_exactly(self, num_bytes):
+        """ Utility function to keep reading from the socket until we get the desired number of bytes """
+        data = b""
+        while num_bytes > 0:
+            new_data = self.sock.recv(num_bytes)
+            if new_data is None:
+                # most likely reason for a none here is the socket being closed on the remote end
+                raise BridgeClosedException()
+            num_bytes = num_bytes - len(new_data)
+            data += new_data
 
-    size_bytes = read_exactly(sock, struct.calcsize(SIZE_FORMAT))
-    size = struct.unpack(SIZE_FORMAT, size_bytes)[0]
+        return data
 
-    data = read_exactly(sock, size)
-    data = data.strip()
+    def write_exactly(self, package):
+        total_size = len(package)
+        sent = 0
+        # noted errors sending large blobs of data with sendall, so we'll send as much as send() allows and keep trying
+        while sent < total_size:
+            # send it all off
+            bytes_sent = self.sock.send(package[sent:])
+            sent = sent + bytes_sent
 
-    return data
+    def close(self):
+        self.sock.close()
 
 
 def can_handle_version(message_dict):
@@ -390,9 +428,7 @@ class BridgeCommandHandlerThread(threading.Thread):
                 # only reply if the command wants a response
                 if want_response:
                     try:
-                        write_size_and_data_to_socket(
-                            self.bridge_conn.get_socket(), result
-                        )
+                        self.bridge_conn.get_socket().write_size_and_data(result)
                     except socket.error:
                         # Other end has closed the socket before we can respond. That's fine, just ask me to do something then ignore me. Jerk. Don't bother staying around, they're probably dead
                         break
@@ -495,8 +531,8 @@ class BridgeReceiverThread(threading.Thread):
 
         while not GLOBAL_BRIDGE_SHUTDOWN:
             try:
-                data = read_size_and_data_from_socket(self.bridge_conn.get_socket())
-            except socket.timeout:
+                data = self.bridge_conn.get_socket().read_size_and_data()
+            except (socket.timeout, Empty):
                 # client didn't have anything to say - just wait some more
                 time.sleep(0.1)
                 continue
@@ -514,8 +550,7 @@ class BridgeReceiverThread(threading.Thread):
                         threadpool.handle_command(msg_dict)
                 else:
                     # bad version
-                    write_size_and_data_to_socket(
-                        self.bridge_conn.get_socket(),
+                    self.bridge_conn.get_socket().write_size_and_data(
                         BridgeReceiverThread.ERROR_UNSUPPORTED_VERSION,
                     )
             except Exception as e:
@@ -536,7 +571,7 @@ class BridgeCommandHandler(socketserver.BaseRequestHandler):
             BridgeReceiverThread(
                 BridgeConn(
                     self.server.bridge,
-                    self.request,
+                    SocketBridgeSocket(self.request),
                     response_timeout=self.server.bridge.response_timeout,
                 )
             ).run()
@@ -912,12 +947,10 @@ class BridgeConn(object):
                 )
 
                 if self.host == HOST_STDIO:
-                    self.sock = StreamsSocket(sys.stdin.buffer, sys.stdout.buffer)
+                    self.sock = StreamsBridgeSocket(sys.stdin.buffer, sys.stdout.buffer)
                 else:
                     # Create a socket (SOCK_STREAM means a TCP socket)
-                    self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    self.sock.settimeout(10)
-                    self.sock.connect((self.host, self.port))
+                    self.sock = SocketBridgeSocket(host=self.host, port=self.port)
 
                 # spin up the recv loop thread in the background
                 BridgeReceiverThread(self).start()
@@ -944,7 +977,7 @@ class BridgeConn(object):
             sock = self.get_socket()
 
         # send the data
-        write_size_and_data_to_socket(sock, data)
+        sock.write_size_and_data(data)
 
         if get_response:
             result = {}
@@ -1466,7 +1499,6 @@ class BridgeConn(object):
     def remote_shutdown(self):
         self.logger.debug("remote_shutdown")
         result = self.deserialize_from_dict(self.send_cmd({CMD: SHUTDOWN}))
-        print(result)
         if SHUTDOWN in result and result[SHUTDOWN]:
             # shutdown received - as a gross hack, send a followup that we don't expect to return, to unblock some loops and actually let things shutdown
             self.send_cmd({CMD: SHUTDOWN}, get_response=False)
@@ -1646,7 +1678,7 @@ class BridgeServer(
         super(BridgeServer, self).__init__()
 
         if (start_command is not None):
-            self.server = BlockingPopenServer(start_command, BridgeCommandHandler)
+            self.server = BlockingPopenServer(start_command)
         else:
             # init the server
             self.server = ThreadingTCPServer(
@@ -2216,31 +2248,53 @@ def nonreturn(func):
 HOST_STDIO = "STDIO"
 
 
-class StreamsSocket(object):
-
+class StreamsBridgeSocket(BridgeSocketBase):
+    
     def __init__(self, stream_read, stream_write):
         self.stream_read = stream_read
         self.stream_write = stream_write
+        self.queue = Queue()
 
-    def send(self, data):
-        self.stream_write.write(data)
-        return len(data)
+        read_thread = threading.Thread(target=self.read_forever)
+        read_thread.daemon = True
+        read_thread.start();
 
-    def recv(self, num_bytes):
-        return self.stream_read.read(num_bytes)
+    def read_size_and_data(self):
+        return self.queue.get(timeout=2)
+
+    def read_forever(self):
+        while True:
+            try:
+                self.queue.put(super(StreamsBridgeSocket, self).read_size_and_data())
+            except BridgeClosedException:
+                break;
+
+    def write_exactly(self, package):
+        self.stream_write.write(package)
+
+    def read_exactly(self, num_bytes):
+        read = self.stream_read.read(num_bytes)
+        if len(read) == 0:
+            raise BridgeClosedException;
+        return read
 
 
-class PopenSocket(StreamsSocket):
+class PopenBridgeSocket(StreamsBridgeSocket):
 
     def __init__(self, popen, peername):
         self.popen = popen
         self.peername = peername
-        super(PopenSocket, self).__init__(popen.stdout, popen.stdin)
+        super(PopenBridgeSocket, self).__init__(popen.stdout, popen.stdin)
+
+    def read_size_and_data(self):
+        if self.popen.poll() is not None:
+            raise BridgeClosedException()
+        return super(PopenBridgeSocket, self).read_size_and_data()
 
     def getpeername(self):
         return self.peername
 
-    def getsocname(self):
+    def getsockname(self):
         return (HOST_STDIO, 0)
 
     def close(self):
@@ -2248,25 +2302,38 @@ class PopenSocket(StreamsSocket):
 
 
 class BlockingPopenServer(object):
-    
-    handler_class = None
-    handler = None
-    command = None
 
+    command = None
     socket = None
 
-    def __init__(self, command, handler):
+    def __init__(self, command):
         self.command = command
-        self.handler_class = handler
 
     def serve_forever(self):
-        self.socket = PopenSocket(
+        self.socket = PopenBridgeSocket(
             subprocess.Popen(self.command, bufsize=0, stdin=subprocess.PIPE, stdout=subprocess.PIPE),
             self.command
         )
 
-        self.handler = self.handler_class(self.socket, self.command, self)
-        self.handler.handle()
+        self.bridge.logger.warn(
+            "Handling connection from command {}".format(self.command)
+        )
+        try:
+            # run the recv loop directly
+            BridgeReceiverThread(
+                BridgeConn(self.bridge, self.socket, response_timeout=self.bridge.response_timeout)
+            ).run()
+
+        except BridgeClosedException:
+            pass  # expected - the client has closed the connection
+        except Exception as e:
+            # something weird went wrong?
+            self.bridge.logger.exception(e)
+        finally:
+            self.bridge.logger.warn(
+                "Closing connection from command {}".format(self.command)
+            )
+            self.bridge.shutdown()
 
     def shutdown(self):
         self.socket.close()
