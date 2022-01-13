@@ -2298,7 +2298,11 @@ class PopenBridgeSocket(StreamsBridgeSocket):
         return (HOST_STDIO, 0)
 
     def close(self):
-        self.popen.terminate()
+        try:
+            self.popen.terminate()
+        except Exception:
+            # The process might already be terminated.
+            pass
 
 
 class BlockingPopenServer(object):
