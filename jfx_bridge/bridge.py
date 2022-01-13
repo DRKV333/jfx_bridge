@@ -26,6 +26,7 @@ import inspect
 import random
 import textwrap
 import types
+import subprocess
 
 __version__ = "0.0.0"  # automatically patched by setup.py when packaging
 
@@ -909,10 +910,15 @@ class BridgeConn(object):
                 self.logger.debug(
                     "Creating socket to {}:{}".format(self.host, self.port)
                 )
-                # Create a socket (SOCK_STREAM means a TCP socket)
-                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.sock.settimeout(10)
-                self.sock.connect((self.host, self.port))
+
+                if self.host == HOST_STDIO:
+                    self.sock = StreamsSocket(sys.stdin.buffer, sys.stdout.buffer)
+                else:
+                    # Create a socket (SOCK_STREAM means a TCP socket)
+                    self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    self.sock.settimeout(10)
+                    self.sock.connect((self.host, self.port))
+
                 # spin up the recv loop thread in the background
                 BridgeReceiverThread(self).start()
 
@@ -1627,6 +1633,7 @@ class BridgeServer(
         local_call_hook=None,
         local_eval_hook=None,
         local_exec_hook=None,
+        start_command=None
     ):
         """ Set up the bridge.
 
@@ -1638,10 +1645,13 @@ class BridgeServer(
 
         super(BridgeServer, self).__init__()
 
-        # init the server
-        self.server = ThreadingTCPServer(
-            (server_host, server_port), BridgeCommandHandler
-        )
+        if (start_command is not None):
+            self.server = BlockingPopenServer(start_command, BridgeCommandHandler)
+        else:
+            # init the server
+            self.server = ThreadingTCPServer(
+                (server_host, server_port), BridgeCommandHandler
+            )
         # the server needs to be able to get back to the bridge to handle commands, but we don't want that reference keeping the bridge alive
         self.server.bridge = weakref.proxy(self)
         self.server.timeout = 1
@@ -2201,3 +2211,79 @@ def nonreturn(func):
     """ Decorator to simplying marking a function as nonreturning for the bridge """
     func._bridge_nonreturn = True
     return func
+
+
+HOST_STDIO = "STDIO"
+
+
+class StreamsSocket(object):
+
+    def __init__(self, stream_read, stream_write):
+        self.stream_read = stream_read
+        self.stream_write = stream_write
+
+    def send(self, data):
+        self.stream_write.write(data)
+        return len(data)
+
+    def recv(self, num_bytes):
+        return self.stream_read.read(num_bytes)
+
+
+class PopenSocket(StreamsSocket):
+
+    def __init__(self, popen, peername):
+        self.popen = popen
+        self.peername = peername
+        super(PopenSocket, self).__init__(popen.stdout, popen.stdin)
+
+    def getpeername(self):
+        return self.peername
+
+    def getsocname(self):
+        return (HOST_STDIO, 0)
+
+    def close(self):
+        self.popen.terminate()
+
+
+class BlockingPopenServer(object):
+    
+    handler_class = None
+    handler = None
+    command = None
+
+    socket = None
+
+    def __init__(self, command, handler):
+        self.command = command
+        self.handler_class = handler
+
+    def serve_forever(self):
+        self.socket = PopenSocket(
+            subprocess.Popen(self.command, bufsize=0, stdin=subprocess.PIPE, stdout=subprocess.PIPE),
+            self.command
+        )
+
+        self.handler = self.handler_class(self.socket, self.command, self)
+        self.handler.handle()
+
+    def shutdown(self):
+        self.socket.close()
+
+    def server_close(self):
+        pass
+
+
+class BridgeStdioRedirect(object):
+    def __init__(self, bridge):
+        self.bridge = bridge
+
+    def __enter__(self):
+        self.orig_stdio = (sys.stdin, sys.stdout)
+        remote_sys = self.bridge.remote_import("sys")
+        sys.stdin = remote_sys.stdin
+        sys.stdout = remote_sys.stdout
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        sys.stdin, sys.stdout = self.orig_stdio
