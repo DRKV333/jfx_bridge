@@ -2274,6 +2274,7 @@ class StreamsBridgeSocket(BridgeSocketBase):
 
     def write_exactly(self, package):
         self.stream_write.write(package)
+        self.stream_write.flush()
 
     def read_exactly(self, num_bytes):
         read = self.stream_read.read(num_bytes)
